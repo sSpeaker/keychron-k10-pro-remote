@@ -1,0 +1,7 @@
+cli/kc
+cli/go.sum
+*.bin
+*.hex
+*.elf
+.build/
+.DS_Store
