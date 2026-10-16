@@ -191,6 +191,7 @@ func main() {
 		os.Exit(exitError)
 	}
 	defer hid.Exit()
+	hidSetup()
 
 	kbs, err := findKeyboards()
 	if err != nil {

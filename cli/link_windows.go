@@ -29,6 +29,8 @@ const (
 
 var procGetKeyState = syscall.NewLazyDLL("user32.dll").NewProc("GetKeyState")
 
+func hidSetup() {}
+
 type ioctlLink struct {
 	handles []syscall.Handle
 }

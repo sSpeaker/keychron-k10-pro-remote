@@ -7,6 +7,8 @@ WIN_CC = x86_64-w64-mingw32-gcc
 build:
 	go mod tidy
 	go build -o $(BINARY) .
+	# Stable identity for Input Monitoring (the Go linker signs it as "a.out")
+	codesign -f -s - -i com.sspeaker.kc $(BINARY)
 
 # Cross-compile from macOS: brew install mingw-w64
 windows:
