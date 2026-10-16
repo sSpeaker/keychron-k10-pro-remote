@@ -161,12 +161,16 @@ static void run_command(void) {
         }
 #endif
 
+        /* Same as the Mac/Win dip switch: the default layer must change,
+         * layer_move() alone loses to a higher default layer */
         case LED_CMD_MAC_LAYER:
-            layer_move(MAC_BASE);
+            layer_clear();
+            default_layer_set(1UL << MAC_BASE);
             break;
 
         case LED_CMD_WIN_LAYER:
-            layer_move(WIN_BASE);
+            layer_clear();
+            default_layer_set(1UL << WIN_BASE);
             break;
 
         default:

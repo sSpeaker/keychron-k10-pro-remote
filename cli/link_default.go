@@ -29,6 +29,14 @@ func (l *hidLink) send(sym byte) error {
 	return err
 }
 
+func (l *hidLink) restore() error {
+	sym := hostLockSymbol()
+	if sym == 0 {
+		return nil
+	}
+	return l.send(sym)
+}
+
 func (l *hidLink) close() {
 	l.dev.Close()
 }

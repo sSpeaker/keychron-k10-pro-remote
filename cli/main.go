@@ -20,6 +20,7 @@ import (
 const (
 	keychronVID = 0x3434
 	stepDelay   = 80 * time.Millisecond
+	abortDelay  = 350 * time.Millisecond // > LED_CMD_WINDOW_MS, lets the keyboard drop a broken frame
 
 	symSeparator = 0
 	symMagic     = 15
@@ -54,8 +55,11 @@ var commands = map[string]command{
 }
 
 // link sends frame symbols to the keyboard; implemented per platform.
+// restore resends the host's real lock state after a frame: QMK only
+// reports changes, so a host report equal to the trailing 0 would be lost.
 type link interface {
 	send(sym byte) error
+	restore() error
 	close()
 }
 
@@ -84,24 +88,18 @@ type keyboard struct {
 }
 
 // findKeyboards returns every keyboard endpoint (usage page 1, usage 6).
-func findKeyboards() []keyboard {
+func findKeyboards() ([]keyboard, error) {
 	var found []keyboard
-	hid.Enumerate(hid.VendorIDAny, hid.ProductIDAny, func(info *hid.DeviceInfo) error {
+	err := hid.Enumerate(hid.VendorIDAny, hid.ProductIDAny, func(info *hid.DeviceInfo) error {
 		if info.VendorID == keychronVID && info.UsagePage == 1 && info.Usage == 6 {
 			found = append(found, keyboard{path: info.Path, name: info.ProductStr})
 		}
 		return nil
 	})
-	return found
+	return found, err
 }
 
-func runFrame(kbs []keyboard, frame []byte) error {
-	l, err := openLink(kbs)
-	if err != nil {
-		return err
-	}
-	defer l.close()
-
+func sendFrame(l link, frame []byte) error {
 	last := len(frame) - 1
 	for i, sym := range frame {
 		// The trailing separator may fail if a BT switch already dropped the link
@@ -111,6 +109,22 @@ func runFrame(kbs []keyboard, frame []byte) error {
 		time.Sleep(stepDelay)
 	}
 	return nil
+}
+
+func runFrame(kbs []keyboard, frame []byte) error {
+	l, err := openLink(kbs)
+	if err != nil {
+		return err
+	}
+	defer l.close()
+
+	err = sendFrame(l, frame)
+	// A broken frame must time out first, or the lock state is read as a command
+	if err != nil {
+		time.Sleep(abortDelay)
+	}
+	_ = l.restore()
+	return err
 }
 
 func usage() {
@@ -178,7 +192,11 @@ func main() {
 	}
 	defer hid.Exit()
 
-	kbs := findKeyboards()
+	kbs, err := findKeyboards()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: hid enumerate: %v\n", err)
+		os.Exit(exitError)
+	}
 
 	if name == "status" {
 		if len(kbs) == 0 {

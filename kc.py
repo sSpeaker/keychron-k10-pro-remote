@@ -38,6 +38,11 @@ IS_WINDOWS   = platform.system() == 'Windows'
 KEYCHRON_VID = 0x3434
 REPORT_ID    = 0x01
 STEP_DELAY   = 0.08
+ABORT_DELAY  = 0.35  # > LED_CMD_WINDOW_MS, lets the keyboard drop a broken frame
+
+# CoreGraphics: CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)
+CG_COMBINED_SESSION_STATE = 0
+CG_FLAG_ALPHA_SHIFT       = 1 << 16
 
 SYM_SEPARATOR = 0
 SYM_MAGIC     = 15
@@ -112,6 +117,16 @@ def path_str(path):
 
 # ── macOS: HID output report ─────────────────────────────────────────
 
+def mac_lock_symbol():
+    """Host Caps Lock state as a symbol (bit 1); macOS has no other lock."""
+    import ctypes
+    cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+    cg.CGEventSourceFlagsState.restype = ctypes.c_uint64
+    cg.CGEventSourceFlagsState.argtypes = [ctypes.c_int32]
+    flags = cg.CGEventSourceFlagsState(CG_COMBINED_SESSION_STATE)
+    return 0x02 if flags & CG_FLAG_ALPHA_SHIFT else 0
+
+
 class MacLink:
     def __init__(self, keyboards):
         import hid
@@ -124,6 +139,13 @@ class MacLink:
 
     def send(self, sym):
         self.dev.write(bytes([REPORT_ID, symbol_to_hid(sym)]))
+
+    def restore(self):
+        """Resend the real lock state: QMK only reports changes, so after the
+        trailing 0 a host report equal to 0 would otherwise be lost."""
+        sym = mac_lock_symbol()
+        if sym:
+            self.send(sym)
 
     def close(self):
         try:
@@ -209,6 +231,7 @@ class WinLink:
 
 def run_frame(keyboards, frame):
     link = WinLink(keyboards) if IS_WINDOWS else MacLink(keyboards)
+    completed = False
     try:
         last = len(frame) - 1
         for i, sym in enumerate(frame):
@@ -219,12 +242,15 @@ def run_frame(keyboards, frame):
                 if i != last:
                     raise
             time.sleep(STEP_DELAY)
-        if IS_WINDOWS:
-            try:
-                link.restore()
-            except Exception:
-                pass
+        completed = True
     finally:
+        # A broken frame must time out first, or the lock state is read as a command
+        if not completed:
+            time.sleep(ABORT_DELAY)
+        try:
+            link.restore()
+        except Exception:
+            pass
         link.close()
 
 
@@ -241,6 +267,12 @@ def print_status(keyboards):
 
 
 def main():
+    # Windows pipes default to the ANSI code page, which cannot encode "✓"
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
     args = [a for a in sys.argv[1:] if a not in ('-s', '--silent')]
     silent = len(args) != len(sys.argv) - 1
 

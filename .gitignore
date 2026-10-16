@@ -1,7 +1,9 @@
 cli/kc
-cli/go.sum
+cli/kc.exe
 *.bin
+!bin/firmware/*.bin
 *.hex
 *.elf
 .build/
 .DS_Store
+__pycache__/

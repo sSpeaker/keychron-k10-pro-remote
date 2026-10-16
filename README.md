@@ -51,11 +51,14 @@ kc -s bt2 || echo "switch failed" >&2
 ## Project Structure
 
 ```
+├── bin/                     prebuilt CLI binaries (macOS arm64, Windows x64) and firmware
 ├── cli/                     Go CLI (single binary)
 │   ├── main.go              commands, frame encoding, device discovery
 │   ├── link_default.go      macOS: HID output reports via go-hid
 │   ├── link_windows.go      Windows: IOCTL_KEYBOARD_SET_INDICATORS
-│   ├── go.mod
+│   ├── lock_darwin.go       macOS: real Caps Lock state via CoreGraphics
+│   ├── lock_other.go        other Unix: no lock state available
+│   ├── go.mod, go.sum
 │   └── Makefile
 ├── firmware/                QMK keymap for K10 Pro ANSI RGB
 │   ├── led_bt_control.h     protocol constants
@@ -148,6 +151,8 @@ go build -o kc.exe .
 .\kc.exe bt2
 ```
 
+Or cross-compile from macOS with `brew install mingw-w64` and `make windows`; `make release` rebuilds both prebuilt binaries in `bin/`.
+
 No administrator rights are needed. The tool opens the keyboard's `\KBD` endpoints, sends each symbol to all of them (Windows accepts the IOCTL on every endpoint but forwards it from one), and afterwards restores the real Num/Caps/Scroll state read with `GetKeyState`.
 
 ## Install — Python CLI
@@ -207,6 +212,10 @@ The firmware and the host tools must be the same protocol version: v1 tools (mag
 **Deferred execution.** Frames are parsed in `led_update_user()`, but commands run 300 ms later from `matrix_scan_user()`. QMK functions such as `rgb_matrix_toggle()` only behave correctly from the main loop, and for a BT switch the delay lets the host finish the frame and restore its lock state before the connection drops.
 
 **Lock indicators.** The magic symbol includes Caps and Num, so drawing the indicators from the raw LED state would flash them on every command. The firmware remembers the last LED state received outside a frame and overrides Keychron's weak `os_state_indicate()` to draw from it.
+
+**Lock state resend.** A frame ends with LED state `0`, and QMK only reports changes. If the host's real state is not `0` (Caps Lock on), its next report of `0` would be dropped and the indicator would stay lit. After every frame the host therefore resends its real lock state: Windows reads it with `GetKeyState`, macOS reads Caps Lock with `CGEventSourceFlagsState`. If a frame breaks halfway, the tool waits 350 ms first so the keyboard times the frame out; otherwise the resent state could be read as a command byte.
+
+**Layout.** `mac` / `win` change the default layer, exactly like the physical Mac/Win switch. Flipping the switch overrides the command.
 
 **Wake-up tap.** After a BT profile switch the firmware sends a phantom F24 keypress after 500 ms to activate the new connection. F24 is ignored by modern operating systems.
 

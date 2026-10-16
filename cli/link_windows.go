@@ -114,9 +114,8 @@ func toggled(vk uintptr) bool {
 	return r&1 != 0
 }
 
-// close puts the real Windows lock state back on the keyboard, then
-// releases the handles.
-func (l *ioctlLink) close() {
+// restore puts the real Windows lock state back on the keyboard.
+func (l *ioctlLink) restore() error {
 	var flags uint16
 	if toggled(vkScroll) {
 		flags |= flagScroll
@@ -127,8 +126,10 @@ func (l *ioctlLink) close() {
 	if toggled(vkCapital) {
 		flags |= flagCaps
 	}
-	_ = l.setFlags(flags)
+	return l.setFlags(flags)
+}
 
+func (l *ioctlLink) close() {
 	for _, h := range l.handles {
 		syscall.CloseHandle(h)
 	}
