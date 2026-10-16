@@ -1,150 +1,190 @@
 # kc — Keychron K10 Pro Wireless Remote Control
 
-Control your Keychron K10 Pro over Bluetooth — switch BT profiles, toggle RGB, change OS layout, manage sleep — all from the command line, no USB cable needed.
+Control a Keychron K10 Pro over Bluetooth from macOS or Windows: switch BT profiles, toggle RGB, set effect and brightness, switch Mac/Windows layout, put the keyboard to sleep. No cable, no extra hardware.
 
 ## How It Works
 
-BLE HID keyboards receive LED indicator reports from the host (Num Lock, Caps Lock, Scroll Lock, Compose, Kana — 5 bits). Compose and Kana are unused on modern systems.
-
-This project uses all 5 bits as a command channel. A modified QMK firmware on the keyboard recognizes a magic byte (`0x18`) and interprets the next byte as a command.
+A keyboard cannot receive arbitrary data from the host over Bluetooth HID, but it does receive the LED indicator state (Num Lock, Caps Lock, Scroll Lock, Compose, Kana). The host tool writes a sequence of LED states, and a modified QMK firmware decodes that sequence as a command.
 
 ```
-Host (macOS/Windows)                Keyboard (QMK firmware)
-    │                                    │
-    ├── LED byte: 0x18 (magic) ────────► ARMED
-    │       80ms
-    ├── LED byte: 0x06 (command) ──────► queue: rgb_toggle
-    │       80ms
-    ├── LED byte: 0x00 (clear) ────────► IDLE
-    │                                    │
-    │         200ms deferred             │
-    │                                    ├── rgb_matrix_toggle()
+Host (kc)                                  K10 Pro (QMK firmware)
+  │ LED state 15  (magic)  ────────────►   start frame
+  │ LED state 6   (command) ───────────►   queue "RGB toggle"
+  │ LED state 0   (separator) ─────────►   frame closed
+  │ real lock state (Windows) ─────────►   normal LED report
+  │                                        300 ms later: rgb_matrix_toggle()
 ```
 
-Commands are deferred 200ms so the host finishes sending all bytes before BT disconnect (for profile switching) and to run in the correct QMK execution context (`matrix_scan` instead of `led_update`).
+The host never changes its own lock state: Caps Lock, Num Lock and Scroll Lock keep working normally.
 
 ## Commands
 
-| Command           | Action                        |
-|-------------------|-------------------------------|
-| `kc bt1`          | Switch to BT device 1         |
-| `kc bt2`          | Switch to BT device 2         |
-| `kc bt3`          | Switch to BT device 3         |
-| `kc bat`          | Show battery level on LEDs    |
-| `kc off`          | Disconnect BT                 |
-| `kc rgb`          | Toggle RGB on/off             |
-| `kc rgb_on`       | Turn on RGB                   |
-| `kc rgb_off`      | Turn off RGB                  |
-| `kc mode <1-31>`  | Set RGB effect by number      |
-| `kc bright <1-31>`| Set RGB brightness (31 = max) |
-| `kc mac`          | Switch to Mac layout          |
-| `kc win`          | Switch to Windows layout      |
-| `kc sleep`        | Put keyboard to deep sleep    |
-| `kc status`       | Show connection info          |
+| Command            | Action                         |
+|--------------------|--------------------------------|
+| `kc bt1`           | Switch to BT device 1          |
+| `kc bt2`           | Switch to BT device 2          |
+| `kc bt3`           | Switch to BT device 3          |
+| `kc bat`           | Show battery level on LEDs     |
+| `kc off`           | Disconnect BT                  |
+| `kc rgb`           | Toggle RGB                     |
+| `kc rgb_on`        | Turn on RGB                    |
+| `kc rgb_off`       | Turn off RGB                   |
+| `kc mode <1-31>`   | Set RGB effect                 |
+| `kc bright <1-31>` | Set RGB brightness (31 = max)  |
+| `kc mac`           | Mac layout (layer 0)           |
+| `kc win`           | Windows layout (layer 2)       |
+| `kc sleep`         | Put keyboard to sleep          |
+| `kc status`        | Show connection info           |
 
-All commands support `-s` / `--silent` flag to suppress output on success.
+`-s` / `--silent` (any position) prints nothing on success. Errors always go to stderr, so scripts can rely on the exit code:
+
+| Exit code | Meaning |
+|-----------|---------|
+| 0 | command sent |
+| 1 | keyboard not found or the command could not be sent |
+| 2 | unknown command or bad argument |
+
+```bash
+kc -s bt2 || echo "switch failed" >&2
+```
 
 ## Project Structure
 
 ```
-├── cli/                        Go CLI (single binary, no dependencies)
-│   ├── main.go
+├── cli/                     Go CLI (single binary)
+│   ├── main.go              commands, frame encoding, device discovery
+│   ├── link_default.go      macOS: HID output reports via go-hid
+│   ├── link_windows.go      Windows: IOCTL_KEYBOARD_SET_INDICATORS
 │   ├── go.mod
 │   └── Makefile
-├── firmware/                   QMK keymap for K10 Pro ANSI RGB
-│   ├── led_bt_control.h        Protocol constants
-│   ├── led_bt_control.c        State machine + command execution
-│   ├── keymap.c                Default keymap + hooks
-│   └── rules.mk                Build config
-├── kc.py                       Python CLI (alternative, needs hidapi)
+├── firmware/                QMK keymap for K10 Pro ANSI RGB
+│   ├── led_bt_control.h     protocol constants
+│   ├── led_bt_control.c     frame parser, command execution, lock indicators
+│   ├── keymap.c             default keymap + led_update_user / matrix_scan_user hooks
+│   └── rules.mk
+├── kc.py                    Python CLI (same protocol, needs hidapi)
 ├── .gitignore
 └── README.md
 ```
 
-## Install — Go CLI (recommended)
+## Protocol v2
 
-Single binary, no runtime dependencies. Works on macOS and Windows.
+### Why only 4 bits
 
-**Prerequisites:** Go 1.21+ with CGo support (GCC must be in PATH).
+| HID LED bit | Lock        | macOS | Windows |
+|-------------|-------------|-------|---------|
+| 0           | Num Lock    | yes   | yes     |
+| 1           | Caps Lock   | yes   | yes     |
+| 2           | Scroll Lock | yes   | yes     |
+| 3           | Compose     | yes   | **no**  |
+| 4           | Kana        | yes   | yes     |
+
+Windows sets keyboard LEDs only through `IOCTL_KEYBOARD_SET_INDICATORS`, whose flags (`ntddkbd.h`) cover Scroll, Num, Caps and Kana. There is no Compose flag, so the protocol uses 4-bit symbols carried on HID bits 0, 1, 2 and 4.
+
+| Symbol bit | HID bit       | Windows LedFlags      |
+|------------|---------------|-----------------------|
+| 0          | 0 (Num)       | `0x02` Num Lock       |
+| 1          | 1 (Caps)      | `0x04` Caps Lock      |
+| 2          | 2 (Scroll)    | `0x01` Scroll Lock    |
+| 3          | 4 (Kana)      | `0x08` Kana           |
+
+### Frames
+
+QMK's `led_task()` only calls `led_update_user()` when the LED state changes, so two equal bytes in a row are lost. Every symbol is therefore followed by a separator `0`:
+
+```
+simple command:   15, cmd, 0
+with parameter:   15, cmd, 0, hi, 0, lo, 0
+```
+
+- `15` — magic (HID `0x17` = Num + Caps + Scroll + Kana), starts a frame. Kana is never set on non-Japanese layouts, so normal lock states never produce it.
+- `cmd` — command code 1–14.
+- `hi`, `lo` — parameter digits 1–14, value = `(hi − 1) × 14 + (lo − 1)`, range 0–195.
+- A gap over 300 ms, or a byte with the Compose bit, aborts the frame.
+
+| Code | Command        | Parameter |
+|------|----------------|-----------|
+| 1    | BT device 1    | –         |
+| 2    | BT device 2    | –         |
+| 3    | BT device 3    | –         |
+| 4    | Battery level  | –         |
+| 5    | BT disconnect  | –         |
+| 6    | RGB toggle     | –         |
+| 7    | RGB on         | –         |
+| 8    | RGB off        | –         |
+| 9    | Mac layer      | –         |
+| 10   | Windows layer  | –         |
+| 11   | Sleep          | –         |
+| 12   | RGB mode       | effect number |
+| 13   | RGB brightness | 1–31      |
+| 14   | free           |           |
+
+Each step takes 80 ms: a simple command takes about 240 ms, a command with a parameter about 560 ms.
+
+## Install — Go CLI
+
+Single binary with no runtime dependencies. Building needs Go 1.21+ and a C compiler (CGo), because `go-hid` compiles hidapi from source.
+
+**macOS**
 
 ```bash
 cd cli
-make
-sudo make install    # installs to /usr/local/bin/kc
+make                  # go mod tidy + go build
+sudo make install     # /usr/local/bin/kc
+sudo kc bt2
 ```
 
-Or manually:
+To run without `sudo`: System Settings → Privacy & Security → Input Monitoring → add the terminal app.
 
-```bash
+**Windows (PowerShell)**
+
+Install Go (`winget install -e --id GoLang.Go`) and GCC from [WinLibs](https://github.com/brechtsanders/winlibs_mingw/releases) (extract to `C:\mingw64`).
+
+```powershell
+$env:Path += ";C:\mingw64\mingw64\bin"
 cd cli
-go get github.com/sstallion/go-hid@latest
-go build -o kc .
-sudo cp kc /usr/local/bin/
+go mod tidy
+go build -o kc.exe .
+.\kc.exe bt2
 ```
 
-**Usage:**
+No administrator rights are needed. The tool opens the keyboard's `\KBD` endpoints, sends each symbol to all of them (Windows accepts the IOCTL on every endpoint but forwards it from one), and afterwards restores the real Num/Caps/Scroll state read with `GetKeyState`.
+
+## Install — Python CLI
 
 ```bash
-sudo kc bt1
-sudo kc rgb
-sudo kc mode 5
-sudo kc bright 20 --silent
-```
+# macOS
+brew install hidapi && pip install hid
+sudo python3 kc.py bt2
 
-To avoid `sudo` on macOS: System Settings → Privacy & Security → Input Monitoring → add your Terminal app.
-
-## Install — Python CLI (alternative)
-
-Lighter setup if Go is not available.
-
-**Prerequisites:**
-
-```bash
-brew install hidapi     # macOS
-pip install hid         # Python bindings
-```
-
-**Usage:**
-
-```bash
-sudo python3 kc.py bt1
-sudo python3 kc.py rgb
-sudo python3 kc.py mode 5
+# Windows
+pip install hidapi
+python kc.py bt2
 ```
 
 ## Install — Firmware
 
 ### Prerequisites
 
-- Keychron QMK fork, `bluetooth_playground` branch
-- ARM cross-compiler (`arm-none-eabi-gcc` 13.x with newlib)
-- QMK Toolbox for flashing (macOS/Windows)
+- Keychron QMK fork, branch `bluetooth_playground` (the K10 Pro is not in mainline QMK)
+- `arm-none-eabi-gcc` with newlib. Homebrew's `arm-none-eabi-gcc` 16.x ships without newlib (`stdint.h: No such file or directory`); use the xPack build instead.
+- QMK Toolbox or `dfu-util` for flashing
 
 ### Build
 
 ```bash
-# Clone Keychron's QMK fork
 git clone --recurse-submodules --branch bluetooth_playground \
-  https://github.com/Keychron/qmk_firmware.git
-cd qmk_firmware
+  https://github.com/Keychron/qmk_firmware.git keychron-qmk
+cd keychron-qmk
+pip install -r requirements.txt
 
-# Install ARM toolchain
-# macOS:
-brew install arm-none-eabi-gcc
-# If Homebrew version lacks newlib, use xPack:
 curl -LO https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v13.3.1-1.1/xpack-arm-none-eabi-gcc-13.3.1-1.1-darwin-arm64.tar.gz
 tar xf xpack-arm-none-eabi-gcc-13.3.1-1.1-darwin-arm64.tar.gz
 export PATH="$PWD/xpack-arm-none-eabi-gcc-13.3.1-1.1/bin:$PATH"
 
-# Install QMK Python dependencies
-pip install -r requirements.txt
-
-# Copy firmware into keymap directory
 mkdir -p keyboards/keychron/k10_pro/ansi/rgb/keymaps/bt_control
-cp /path/to/this/repo/firmware/* \
-  keyboards/keychron/k10_pro/ansi/rgb/keymaps/bt_control/
+cp /path/to/this/repo/firmware/* keyboards/keychron/k10_pro/ansi/rgb/keymaps/bt_control/
 
-# Build
 make keychron/k10_pro/ansi/rgb:bt_control
 ```
 
@@ -152,60 +192,33 @@ Output: `keychron_k10_pro_ansi_rgb_bt_control.bin`
 
 ### Flash
 
-1. Disconnect USB cable
-2. Toggle switch → **Off**
-3. Hold **Esc** key
-4. Plug in USB cable, toggle → **Cable**
-5. Hold Esc 3 more seconds, then release
-6. QMK Toolbox → Open `.bin` → Flash
-7. After flashing, toggle → **BT**
+1. Switch on the back → **Off**, unplug USB
+2. Hold **Esc**, plug in USB, switch → **Cable**
+3. Keep holding Esc 2–3 s, release
+4. QMK Toolbox → Open the `.bin` → **Flash** (or `make keychron/k10_pro/ansi/rgb:bt_control:flash`)
+5. Switch → **BT**
 
-If DFU mode doesn't activate with Esc, use the hardware reset button (pinhole on the bottom under the spacebar).
+If DFU mode does not start, remove the spacebar keycap and hold the Reset button under it while plugging in USB.
 
-## Protocol Reference
-
-5-bit encoding over HID LED output report. Report ID `0x01` on macOS BLE.
-
-| Code | Command        | Type   |
-|------|----------------|--------|
-| 0x01 | BT device 1    | direct |
-| 0x02 | BT device 2    | direct |
-| 0x03 | BT device 3    | direct |
-| 0x04 | Battery level  | direct |
-| 0x05 | BT disconnect  | direct |
-| 0x06 | RGB toggle     | direct |
-| 0x07 | RGB on         | direct |
-| 0x08 | RGB off        | direct |
-| 0x09 | Mac layer      | direct |
-| 0x0A | Win layer      | direct |
-| 0x0B | Sleep          | direct |
-| 0x0C | Set RGB mode   | param  |
-| 0x0D | Set brightness | param  |
-
-**Direct commands** — 3 steps: `magic → command → clear`
-
-**Parameterized commands** — 4 steps: `magic → command → value (1-31) → clear`
-
-Codes 0x0E–0x1F are free for future commands.
+The firmware and the host tools must be the same protocol version: v1 tools (magic `0x18`) do not work with v2 firmware.
 
 ## Implementation Notes
 
-**Deferred execution.** All commands are parsed in `led_update_user()` (LED interrupt context) but executed in `led_bt_control_task()` via `matrix_scan_user()` (main loop context). This is required because QMK functions like `rgb_matrix_toggle()` only work from the main loop.
+**Deferred execution.** Frames are parsed in `led_update_user()`, but commands run 300 ms later from `matrix_scan_user()`. QMK functions such as `rgb_matrix_toggle()` only behave correctly from the main loop, and for a BT switch the delay lets the host finish the frame and restore its lock state before the connection drops.
 
-**BT switch delay.** BT profile commands are deferred 200ms so the host finishes the full protocol before the keyboard disconnects from the current BLE connection.
+**Lock indicators.** The magic symbol includes Caps and Num, so drawing the indicators from the raw LED state would flash them on every command. The firmware remembers the last LED state received outside a frame and overrides Keychron's weak `os_state_indicate()` to draw from it.
 
-**Wake-up tap.** After switching BT profiles, the firmware sends a phantom F24 keypress (500ms delay) to activate the new BLE connection. F24 is ignored by all modern OSes.
+**Wake-up tap.** After a BT profile switch the firmware sends a phantom F24 keypress after 500 ms to activate the new connection. F24 is ignored by modern operating systems.
 
-**Sleep mode.** Uses `PM_STOP1` (STM32L432 Stop mode 1) — same as Keychron's built-in auto-sleep. Microamp power consumption, instant wakeup on any keypress. `rgb_matrix_driver_shutdown()` physically turns off the LED driver chip before sleep.
+**Sleep.** Uses `LOW_POWER_MODE` (`PM_STOP1`), the same mode as Keychron's auto-sleep. `rgb_matrix_driver_shutdown()` turns the LED driver off first; it comes back on the first flush after wakeup. Any key wakes the keyboard.
 
-**RGB control.** `rgb_on`/`rgb_off` use `rgb_matrix_toggle()` with state check (idempotent). `mode` and `bright` auto-enable RGB if it was off. All changes persist in EEPROM across power cycles (but not across reflashes).
+**RGB.** `rgb_on` / `rgb_off` use `rgb_matrix_toggle()` with a state check. `mode` and `bright` enable RGB first, because `rgb_matrix_mode()` is ignored while RGB is disabled.
 
 ## Compatibility
 
-- **Keyboard:** Keychron K10 Pro, ANSI layout, RGB
-- **Host OS:** macOS (tested on macOS 26 / Apple Silicon), Windows (untested, should work)
-- **QMK branch:** `bluetooth_playground` (Keychron fork)
-- **BT chip:** CKBT51 (Broadcom) — closed firmware, not modified
+- Keyboard: Keychron K10 Pro, ANSI, RGB
+- Host: macOS (BLE HID), Windows (Bluetooth Classic HID)
+- QMK: Keychron fork, `bluetooth_playground`
 
 ## License
 

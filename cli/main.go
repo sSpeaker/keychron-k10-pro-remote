@@ -1,18 +1,10 @@
-// kc - Keychron K10 Pro wireless remote control
+// kc - Keychron K10 Pro wireless remote control (protocol v2)
 //
-// Control your K10 Pro over Bluetooth from macOS or Windows.
-// Requires bt_control firmware on the keyboard.
+// Sends commands to the keyboard through HID LED output reports.
+// Requires the bt_control firmware on the keyboard.
 //
-// Build:
-//
-//	go mod tidy && go build -o kc .
-//
-// Usage:
-//
-//	sudo ./kc bt1             Switch to BT device 1
-//	sudo ./kc rgb             Toggle RGB
-//	sudo ./kc mode 5          Set RGB effect
-//	sudo ./kc status          Show connection info
+// macOS:   HID output reports (needs sudo or Input Monitoring permission)
+// Windows: IOCTL_KEYBOARD_SET_INDICATORS on the keyboard \KBD endpoints
 package main
 
 import (
@@ -26,204 +18,213 @@ import (
 )
 
 const (
-	magic    = 0x18
-	reportID = 0x01
-	delay    = 80 * time.Millisecond
-	vid      = 0x3434 // Keychron VID
+	keychronVID = 0x3434
+	stepDelay   = 80 * time.Millisecond
+
+	symSeparator = 0
+	symMagic     = 15
+	symDigits    = 14 // parameter digits are 1..14, value range 0..195
+
+	// Exit codes
+	exitError = 1 // keyboard not found or the command could not be sent
+	exitUsage = 2 // unknown command or bad argument
 )
 
-// Command codes (must match led_bt_control.h)
-var commands = map[string]struct {
+type command struct {
 	code  byte
 	label string
-	param bool // true = needs a value argument
-}{
-	"bt1":     {0x01, "Switch to BT 1", false},
-	"bt2":     {0x02, "Switch to BT 2", false},
-	"bt3":     {0x03, "Switch to BT 3", false},
-	"bat":     {0x04, "Battery level", false},
-	"off":     {0x05, "Disconnect BT", false},
-	"rgb":     {0x06, "RGB toggle", false},
-	"rgb_on":  {0x07, "RGB on", false},
-	"rgb_off": {0x08, "RGB off", false},
-	"mac":     {0x09, "Mac layout", false},
-	"win":     {0x0A, "Windows layout", false},
-	"sleep":   {0x0B, "Keyboard sleep", false},
-	"mode":    {0x0C, "RGB mode", true},
-	"bright":  {0x0D, "RGB brightness", true},
+	param bool
 }
 
-// findKeyboard returns the HID path for the K10 Pro keyboard endpoint.
-func findKeyboard() (path, name string, err error) {
-	found := false
+// Command codes must match led_bt_control.h
+var commands = map[string]command{
+	"bt1":     {1, "Switch to BT 1", false},
+	"bt2":     {2, "Switch to BT 2", false},
+	"bt3":     {3, "Switch to BT 3", false},
+	"bat":     {4, "Battery level", false},
+	"off":     {5, "Disconnect BT", false},
+	"rgb":     {6, "RGB toggle", false},
+	"rgb_on":  {7, "RGB on", false},
+	"rgb_off": {8, "RGB off", false},
+	"mac":     {9, "Mac layout", false},
+	"win":     {10, "Windows layout", false},
+	"sleep":   {11, "Keyboard sleep", false},
+	"mode":    {12, "RGB mode", true},
+	"bright":  {13, "RGB brightness", true},
+}
+
+// link sends frame symbols to the keyboard; implemented per platform.
+type link interface {
+	send(sym byte) error
+	close()
+}
+
+// buildFrame returns the symbols of one frame. Every symbol is followed by
+// a separator so no two consecutive bytes are equal: QMK only reports LED
+// state changes, so a repeated byte would be lost. value < 0 means none.
+func buildFrame(code byte, value int) []byte {
+	frame := []byte{symMagic, code, symSeparator}
+	if value >= 0 {
+		hi := byte(value/symDigits + 1)
+		lo := byte(value%symDigits + 1)
+		frame = append(frame, hi, symSeparator, lo, symSeparator)
+	}
+	return frame
+}
+
+// symbolToHID maps symbol bits 0-3 to HID LED bits 0 (Num), 1 (Caps),
+// 2 (Scroll) and 4 (Kana).
+func symbolToHID(sym byte) byte {
+	return (sym & 0x07) | ((sym & 0x08) << 1)
+}
+
+type keyboard struct {
+	path string
+	name string
+}
+
+// findKeyboards returns every keyboard endpoint (usage page 1, usage 6).
+func findKeyboards() []keyboard {
+	var found []keyboard
 	hid.Enumerate(hid.VendorIDAny, hid.ProductIDAny, func(info *hid.DeviceInfo) error {
-		if info.VendorID == vid && info.UsagePage == 1 && info.Usage == 6 {
-			path = info.Path
-			name = info.ProductStr
-			found = true
+		if info.VendorID == keychronVID && info.UsagePage == 1 && info.Usage == 6 {
+			found = append(found, keyboard{path: info.Path, name: info.ProductStr})
 		}
 		return nil
 	})
-	if !found {
-		return "", "", fmt.Errorf("K10 Pro not found. Is BT connected?")
-	}
-	return path, name, nil
+	return found
 }
 
-// send writes a byte to the device, waits, and returns any error.
-func send(dev *hid.Device, b byte) error {
-	_, err := dev.Write([]byte{reportID, b})
+func runFrame(kbs []keyboard, frame []byte) error {
+	l, err := openLink(kbs)
 	if err != nil {
 		return err
 	}
-	time.Sleep(delay)
-	return nil
-}
+	defer l.close()
 
-// runCommand opens the keyboard, sends the protocol sequence, and closes.
-func runCommand(path string, code byte, value *byte) error {
-	dev, err := hid.OpenPath(path)
-	if err != nil {
-		return fmt.Errorf("open: %w", err)
-	}
-	defer dev.Close()
-
-	// Step 1: magic
-	if err := send(dev, magic); err != nil {
-		return err
-	}
-
-	// Step 2: command
-	if err := send(dev, code); err != nil {
-		return err
-	}
-
-	// Step 3 (parameterized only): value
-	if value != nil {
-		if err := send(dev, *value); err != nil {
+	last := len(frame) - 1
+	for i, sym := range frame {
+		// The trailing separator may fail if a BT switch already dropped the link
+		if err := l.send(sym); err != nil && i != last {
 			return err
 		}
+		time.Sleep(stepDelay)
 	}
-
-	// Final step: clear (may fail on BT switch — that's OK)
-	_ = send(dev, 0x00)
 	return nil
 }
 
 func usage() {
-	fmt.Println("kc - Keychron K10 Pro remote control")
-	fmt.Println()
-	fmt.Println("Bluetooth:")
-	fmt.Println("  kc bt1             Switch to BT device 1")
-	fmt.Println("  kc bt2             Switch to BT device 2")
-	fmt.Println("  kc bt3             Switch to BT device 3")
-	fmt.Println("  kc bat             Show battery level")
-	fmt.Println("  kc off             Disconnect BT")
-	fmt.Println()
-	fmt.Println("RGB:")
-	fmt.Println("  kc rgb             Toggle on/off")
-	fmt.Println("  kc rgb_on          Turn on")
-	fmt.Println("  kc rgb_off         Turn off")
-	fmt.Println("  kc mode <1-31>     Set effect")
-	fmt.Println("  kc bright <1-31>   Set brightness")
-	fmt.Println()
-	fmt.Println("Layout:")
-	fmt.Println("  kc mac             Mac layout")
-	fmt.Println("  kc win             Windows layout")
-	fmt.Println()
-	fmt.Println("Power:")
-	fmt.Println("  kc sleep           Keyboard sleep")
-	fmt.Println()
-	fmt.Println("Info:")
-	fmt.Println("  kc status          Connection info")
-	fmt.Println()
-	fmt.Println("Flags:")
-	fmt.Println("  -s, --silent       No output on success")
+	fmt.Println(`kc - Keychron K10 Pro remote control
+
+Bluetooth:
+  kc bt1              Switch to BT device 1
+  kc bt2              Switch to BT device 2
+  kc bt3              Switch to BT device 3
+  kc bat              Show battery level
+  kc off              Disconnect BT
+
+RGB:
+  kc rgb              Toggle RGB
+  kc rgb_on           Turn on RGB
+  kc rgb_off          Turn off RGB
+  kc mode <1-31>      Set RGB effect
+  kc bright <1-31>    Set RGB brightness
+
+Layout:
+  kc mac              Mac layout
+  kc win              Windows layout
+
+Power:
+  kc sleep            Keyboard sleep
+
+Info:
+  kc status           Connection info
+
+Flags:
+  -s, --silent        No output on success; errors still go to stderr
+
+Exit codes: 0 success, 1 keyboard/send error, 2 bad command or argument`)
+}
+
+func printStatus(kbs []keyboard) {
+	fmt.Printf("  Keyboard:  %s\n", kbs[0].name)
+	fmt.Printf("  Method:    %s\n", linkMethod)
+	for _, kb := range kbs {
+		fmt.Printf("  Endpoint:  %s\n", kb.path)
+	}
 }
 
 func main() {
-	// Parse flags
 	silent := false
-	args := []string{}
+	var args []string
 	for _, a := range os.Args[1:] {
-		if a == "--silent" || a == "-s" {
+		if a == "-s" || a == "--silent" {
 			silent = true
 		} else {
 			args = append(args, a)
 		}
 	}
 
-	if len(args) < 1 {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		usage()
-		os.Exit(0)
+		return
 	}
 
-	arg := strings.ToLower(args[0])
+	name := strings.ToLower(args[0])
 
-	if arg == "-h" || arg == "--help" || arg == "help" {
-		usage()
-		os.Exit(0)
+	if err := hid.Init(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: hid init: %v\n", err)
+		os.Exit(exitError)
 	}
-
-	hid.Init()
 	defer hid.Exit()
 
-	if arg == "status" {
-		path, name, err := findKeyboard()
-		if err != nil {
-			fmt.Println("  " + err.Error())
-			os.Exit(1)
+	kbs := findKeyboards()
+
+	if name == "status" {
+		if len(kbs) == 0 {
+			fmt.Fprintln(os.Stderr, "K10 Pro not found. Is BT connected?")
+			os.Exit(exitError)
 		}
-		fmt.Printf("  Keyboard:  %s\n", name)
-		fmt.Printf("  Path:      %s\n", path)
-		fmt.Printf("  Transport: BLE HID\n")
-		os.Exit(0)
+		printStatus(kbs)
+		return
 	}
 
-	cmd, ok := commands[arg]
+	cmd, ok := commands[name]
 	if !ok {
-		fmt.Printf("Unknown command: %s\n\n", arg)
-		usage()
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "Unknown command: %s (kc --help for the list)\n", name)
+		os.Exit(exitUsage)
 	}
 
-	var value *byte
+	value := -1
 	if cmd.param {
 		if len(args) < 2 {
-			fmt.Printf("Usage: kc %s <1-31>\n", arg)
-			os.Exit(1)
+			fmt.Fprintf(os.Stderr, "Usage: kc %s <1-31>\n", name)
+			os.Exit(exitUsage)
 		}
 		v, err := strconv.Atoi(args[1])
 		if err != nil || v < 1 || v > 31 {
-			fmt.Printf("Value must be 1-31, got: %s\n", args[1])
-			os.Exit(1)
+			fmt.Fprintf(os.Stderr, "Value must be 1-31, got: %s\n", args[1])
+			os.Exit(exitUsage)
 		}
-		b := byte(v)
-		value = &b
+		value = v
 	}
 
-	path, _, err := findKeyboard()
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+	if len(kbs) == 0 {
+		fmt.Fprintln(os.Stderr, "K10 Pro not found. Is BT connected?")
+		os.Exit(exitError)
 	}
 
-	if err := runCommand(path, cmd.code, value); err != nil {
-		errMsg := strings.ToLower(err.Error())
-		if strings.Contains(errMsg, "privilege") || strings.Contains(errMsg, "permission") {
-			fmt.Println("Error: HID access requires elevated privileges.")
-			fmt.Printf("\n  sudo kc %s\n\n", strings.Join(args, " "))
-			fmt.Println("  Or add Terminal to:")
-			fmt.Println("  System Settings → Privacy & Security → Input Monitoring")
-			os.Exit(1)
+	if err := runFrame(kbs, buildFrame(cmd.code, value)); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		if permissionHint != "" {
+			fmt.Fprintln(os.Stderr, permissionHint)
 		}
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
+		os.Exit(exitError)
 	}
 
 	if !silent {
-		if value != nil {
-			fmt.Printf("✓ %s → %d\n", cmd.label, *value)
+		if value >= 0 {
+			fmt.Printf("✓ %s → %d\n", cmd.label, value)
 		} else {
 			fmt.Printf("✓ %s\n", cmd.label)
 		}
